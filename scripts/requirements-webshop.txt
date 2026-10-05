@@ -1,0 +1,16 @@
+# WebShop runtime only; do not replace the training PyTorch/Transformers stack.
+beautifulsoup4==4.11.1
+cleantext==1.1.4
+Flask==2.1.2
+Werkzeug==2.1.0
+gdown
+gym==0.26.2
+pyserini==0.17.0
+rank_bm25==0.2.2
+requests>=2.27.1
+rich>=12.4.4
+selenium==4.2.0
+spacy==3.7.2
+thefuzz==0.19.0
+numpy==1.26.4
+faiss-cpu
