@@ -65,6 +65,10 @@ class TaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
 
+        # Optional RELACE trajectory-analysis diagnostic: one task group per attempt, no training.
+        from relace.trajectory_analysis import prepare_config as prepare_trajectory_analysis
+        trajectory_analysis = prepare_trajectory_analysis(config)
+
         # download the checkpoint from hdfs
         local_path = copy_to_local(config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False))
 
@@ -186,7 +190,10 @@ class TaskRunner:
             val_envs=val_envs,
         )
         trainer.init_workers()
-        trainer.fit()
+        if trajectory_analysis:
+            trainer.analyze_trajectories()
+        else:
+            trainer.fit()
 
 
 if __name__ == "__main__":

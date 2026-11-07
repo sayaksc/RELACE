@@ -264,6 +264,43 @@ def write_failures(scores, file_dir, model_name, task_string):
 
 
 
+def relace_advantage_inputs(data: DataProto, gamma=1.0, step_advantage_w=1.0, gigpo_mode="mean_std_norm", **kwargs) -> dict:
+    """Map a rollout batch and `compute_advantage` settings to RELACE keyword arguments.
+
+    Shared by training (`compute_advantage`) and the trajectory-analysis diagnostic so
+    both feed identical inputs to `core_relace`.
+    """
+    if 'hindsight_log_probs' not in data.batch.keys():
+        raise KeyError("RELACE requires batch['hindsight_log_probs'] from the hindsight teacher-forced pass.")
+    if 'old_log_probs' not in data.batch.keys():
+        raise KeyError("RELACE requires batch['old_log_probs'] (log pi(a|X_t)) from the policy log-prob pass.")
+    return dict(
+        token_level_rewards=data.batch['token_level_rewards'],
+        response_mask=data.batch['response_mask'],
+        hindsight_log_probs=data.batch['hindsight_log_probs'],
+        action_log_probs=data.batch['old_log_probs'],
+        anchor_obs=data.non_tensor_batch['anchor_obs'],
+        index=data.non_tensor_batch['uid'],
+        traj_index=data.non_tensor_batch['traj_uid'],
+        timestep=data.non_tensor_batch.get('t', None),
+        episode_lengths=data.non_tensor_batch.get('episode_lengths', None),
+        episode_returns=data.non_tensor_batch.get('episode_rewards', None),
+        success_mask=data.non_tensor_batch.get('episode_success', None),
+        mode=gigpo_mode,
+        enable_similarity=kwargs.get('gigpo_enable_similarity', False),
+        similarity_thresh=kwargs.get('gigpo_similarity_thresh', 0.95),
+        epsilon=kwargs.get('epsilon', 1e-6),
+        temp=kwargs.get('relace_temp', 1.0),
+        clip_min=kwargs.get('relace_clip_min', 0.8),
+        clip_max=kwargs.get('relace_clip_max', 1.2),
+        omega=kwargs.get('relace_omega', step_advantage_w),
+        gamma=kwargs.get('relace_gamma', gamma),
+        smooth=kwargs.get('relace_smooth', False),
+        alpha=kwargs.get('relace_alpha', 1.0),
+        no_harm=kwargs.get('relace_no_harm', True),
+    )
+
+
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, step_advantage_w=1.0, gigpo_mode="mean_std_norm",**kwargs):
     """Compute advantage estimates for policy optimization.
 
@@ -383,35 +420,10 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == AdvantageEstimator.RELACE:
-        if 'hindsight_log_probs' not in data.batch.keys():
-            raise KeyError("RELACE requires batch['hindsight_log_probs'] from the hindsight teacher-forced pass.")
-        if 'old_log_probs' not in data.batch.keys():
-            raise KeyError("RELACE requires batch['old_log_probs'] (log pi(a|X_t)) from the policy log-prob pass.")
-        advantages, returns, relace_metrics = core_relace.compute_relace_advantage(
-            token_level_rewards=data.batch['token_level_rewards'],
-            response_mask=data.batch['response_mask'],
-            hindsight_log_probs=data.batch['hindsight_log_probs'],
-            action_log_probs=data.batch['old_log_probs'],
-            anchor_obs=data.non_tensor_batch['anchor_obs'],
-            index=data.non_tensor_batch['uid'],
-            traj_index=data.non_tensor_batch['traj_uid'],
-            timestep=data.non_tensor_batch.get('t', None),
-            episode_lengths=data.non_tensor_batch.get('episode_lengths', None),
-            episode_returns=data.non_tensor_batch.get('episode_rewards', None),
-            success_mask=data.non_tensor_batch.get('episode_success', None),
-            mode=gigpo_mode,
-            enable_similarity=kwargs.get('gigpo_enable_similarity', False),
-            similarity_thresh=kwargs.get('gigpo_similarity_thresh', 0.95),
-            epsilon=kwargs.get('epsilon', 1e-6),
-            temp=kwargs.get('relace_temp', 1.0),
-            clip_min=kwargs.get('relace_clip_min', 0.8),
-            clip_max=kwargs.get('relace_clip_max', 1.2),
-            omega=kwargs.get('relace_omega', step_advantage_w),
-            gamma=kwargs.get('relace_gamma', gamma),
-            smooth=kwargs.get('relace_smooth', False),
-            alpha=kwargs.get('relace_alpha', 1.0),
-            no_harm=kwargs.get('relace_no_harm', True),
-            )
+        relace_inputs = relace_advantage_inputs(
+            data, gamma=gamma, step_advantage_w=step_advantage_w, gigpo_mode=gigpo_mode, **kwargs
+        )
+        advantages, returns, relace_metrics = core_relace.compute_relace_advantage(**relace_inputs)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
         data.meta_info['relace_metrics'] = relace_metrics
@@ -528,7 +540,9 @@ class RayPPOTrainer:
 
         # 1. Check total batch size for data correctness
         real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
-        assert real_train_batch_size % n_gpus == 0, f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
+        # The trajectory-analysis diagnostic samples one task group and never updates the actor.
+        if not config.get("trajectory_analysis", {}).get("enable", False):
+            assert real_train_batch_size % n_gpus == 0, f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
 
         # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
         # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
@@ -1168,6 +1182,32 @@ class RayPPOTrainer:
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _compute_advantage_kwargs(self) -> dict:
+        """Keyword arguments for `compute_advantage`, shared by `fit` and `analyze_trajectories`."""
+        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
+        return dict(
+            adv_estimator=self.config.algorithm.adv_estimator,
+            gamma=self.config.algorithm.gamma,
+            lam=self.config.algorithm.lam,
+            num_repeat=self.config.actor_rollout_ref.rollout.n,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+            use_pf_ppo=self.config.algorithm.use_pf_ppo,
+            pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
+            pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
+            step_advantage_w=self.config.algorithm.get("gigpo", {}).get("step_advantage_w", 1.0),
+            gigpo_mode=self.config.algorithm.get("gigpo", {}).get("mode", "mean_std_norm"),
+            gigpo_enable_similarity=self.config.algorithm.get("gigpo", {}).get("enable_similarity", False),
+            gigpo_similarity_thresh=self.config.algorithm.get("gigpo", {}).get("similarity_thresh", 0.95),
+            **{
+                f"relace_{key}": value
+                for key, value in self.config.algorithm.get("relace", {}).items()
+                if key != "hindsight_template"
+            },
+            history_length=getattr(self.config.env, "history_length", 2),
+            epsilon=1e-6,
+        )
+
     def _hindsight_config(self):
         """Return RELACE hindsight settings."""
         return self.config.algorithm.get("relace", {})
@@ -1265,12 +1305,8 @@ class RayPPOTrainer:
             prompt_texts.append(self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=False))
         return prompt_texts
 
-    def _build_relace_hindsight_batch(self, batch: DataProto) -> DataProto:
-        if batch.batch["position_ids"].dim() == 3:
-            raise NotImplementedError("RELACE hindsight retokenization currently supports text-only WebShop batches.")
-        if "response_mask" not in batch.batch.keys():
-            batch.batch["response_mask"] = compute_response_mask(batch)
-
+    def _relace_hindsight_prompts(self, batch: DataProto) -> list[str]:
+        """Outcome-augmented prompt text for every row (before tokenization)."""
         relace_cfg = self._hindsight_config()
         template_name = relace_cfg.get("hindsight_template", "webshop_result")
         final_obs = batch.non_tensor_batch.get("final_obs", np.array([""] * len(batch), dtype=object))
@@ -1283,10 +1319,9 @@ class RayPPOTrainer:
         current_observations = batch.non_tensor_batch.get("hindsight_current_observation", np.array([""] * len(batch), dtype=object))
         available_actions = batch.non_tensor_batch.get("hindsight_available_actions", np.array([""] * len(batch), dtype=object))
 
-        prompt_ids = []
-        prompt_attention_masks = []
+        hindsight_prompts = []
         for row_idx, (prompt_text, final_state) in enumerate(zip(prompt_texts, final_obs)):
-            hindsight_prompt = self._format_relace_hindsight_prompt(
+            hindsight_prompts.append(self._format_relace_hindsight_prompt(
                 prompt_text=prompt_text,
                 final_obs=str(final_state),
                 template_name=template_name,
@@ -1297,7 +1332,21 @@ class RayPPOTrainer:
                 current_observation=str(current_observations[row_idx]),
                 available_actions=str(available_actions[row_idx]),
                 current_action=str(current_actions[row_idx]),
-            )
+            ))
+        return hindsight_prompts
+
+    def _build_relace_hindsight_batch(self, batch: DataProto, hindsight_prompts: list[str] | None = None) -> DataProto:
+        if batch.batch["position_ids"].dim() == 3:
+            raise NotImplementedError("RELACE hindsight retokenization currently supports text-only WebShop batches.")
+        if "response_mask" not in batch.batch.keys():
+            batch.batch["response_mask"] = compute_response_mask(batch)
+
+        if hindsight_prompts is None:
+            hindsight_prompts = self._relace_hindsight_prompts(batch)
+
+        prompt_ids = []
+        prompt_attention_masks = []
+        for hindsight_prompt in hindsight_prompts:
             input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(
                 prompt=hindsight_prompt,
                 tokenizer=self.tokenizer,
@@ -1325,6 +1374,137 @@ class RayPPOTrainer:
                 "position_ids": position_ids,
             },
             meta_info=dict(batch.meta_info),
+        )
+
+    def analyze_trajectories(self):
+        """RELACE trajectory-analysis diagnostic (no parameter updates).
+
+        From a fixed checkpoint, samples one rollout group per attempt until a group has a
+        successful trajectory, a failed trajectory, and a matched state shared across
+        trajectories. That group is then scored exactly as in `fit` (reward, log pi(a|X_t),
+        hindsight log-probs, `compute_advantage`) and written out with every RELACE
+        intermediate, alongside a rho=1 recomputation on the identical batch.
+        """
+        from datetime import datetime
+
+        from relace import trajectory_analysis
+
+        cfg = self.config.trajectory_analysis
+        if self.config.algorithm.adv_estimator != AdvantageEstimator.RELACE:
+            raise ValueError("trajectory_analysis requires algorithm.adv_estimator=relace")
+        if self.config.algorithm.use_kl_in_reward:
+            raise NotImplementedError("trajectory_analysis does not support algorithm.use_kl_in_reward=True")
+
+        checkpoint = cfg.get("checkpoint", None)
+        if checkpoint:
+            checkpoint = os.path.abspath(str(checkpoint))
+            actor_path = checkpoint if os.path.basename(checkpoint.rstrip("/")) == "actor" else os.path.join(checkpoint, "actor")
+            if not os.path.isdir(actor_path):
+                raise FileNotFoundError(f"trajectory_analysis.checkpoint: no actor checkpoint at {actor_path}")
+            print(f"[trajectory_analysis] loading actor checkpoint {actor_path}")
+            self.actor_rollout_wg.load_checkpoint(actor_path, del_local_after_load=False)
+        else:
+            print(f"[trajectory_analysis] no checkpoint given; using {self.config.actor_rollout_ref.model.path}")
+
+        output_root = cfg.get("output_dir", None) or os.path.join(self.config.trainer.default_local_dir, "trajectory_analysis")
+        out_dir = os.path.join(output_root, datetime.now().strftime("%Y%m%d-%H%M%S"))
+        os.makedirs(out_dir, exist_ok=True)
+
+        adv_kwargs = self._compute_advantage_kwargs()
+        enable_similarity = adv_kwargs["gigpo_enable_similarity"]
+        similarity_thresh = adv_kwargs["gigpo_similarity_thresh"]
+        max_attempts = int(cfg.get("max_attempts", 20))
+        min_shared = int(cfg.get("min_shared_trajectories", 2))
+        group_size = int(self.config.env.rollout.n)
+
+        def batches():
+            while True:
+                yield from self.train_dataloader
+
+        attempts = []
+        data_iter = batches()
+        for attempt in range(1, max_attempts + 1):
+            batch: DataProto = DataProto.from_single_dict(next(data_iter))
+            non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
+            for key in ["multi_modal_data", "raw_prompt", "tools_kwargs", "env_kwargs"]:
+                if key in batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append(key)
+            gen_batch = batch.pop(batch_keys=["input_ids", "attention_mask", "position_ids"], non_tensor_batch_keys=non_tensor_batch_keys_to_pop)
+            batch = self.traj_collector.multi_turn_loop(
+                gen_batch=gen_batch, actor_rollout_wg=self.actor_rollout_wg, envs=self.envs, is_train=True,
+            )
+
+            step_group_uids = core_gigpo.build_step_group(
+                batch.non_tensor_batch["anchor_obs"], batch.non_tensor_batch["uid"], enable_similarity, similarity_thresh,
+            )
+            check = trajectory_analysis.check_group(
+                trajectory_analysis.trajectory_success(batch.non_tensor_batch),
+                batch.non_tensor_batch["traj_uid"], step_group_uids, min_shared,
+            )
+            attempts.append({"attempt": attempt, **check})
+            print(f"[trajectory_analysis] attempt {attempt}/{max_attempts}: {check}")
+            if not check["qualifies"]:
+                continue
+
+            # Score the group exactly as `fit` does for RELACE.
+            batch.batch["response_mask"] = compute_response_mask(batch)
+            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+
+            padded_batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
+            old_log_prob = self.actor_rollout_wg.compute_log_prob(padded_batch)
+            old_log_prob = unpad_dataproto(old_log_prob, pad_size=pad_size)
+            old_log_prob.batch.pop("entropys")
+            batch = batch.union(old_log_prob)
+
+            original_prompts = self._decode_prompt_texts(batch)
+            hindsight_prompts = self._relace_hindsight_prompts(batch)
+            hindsight_batch = self._build_relace_hindsight_batch(batch, hindsight_prompts)
+            hindsight_batch, pad_size = pad_dataproto_to_divisor(hindsight_batch, self.actor_rollout_wg.world_size)
+            hindsight_log_prob = self.actor_rollout_wg.compute_log_prob(hindsight_batch)
+            hindsight_log_prob = unpad_dataproto(hindsight_log_prob, pad_size=pad_size)
+            batch.batch["hindsight_log_probs"] = hindsight_log_prob.batch["old_log_probs"]
+
+            batch.batch["token_level_scores"] = reward_tensor
+            if reward_extra_infos_dict:
+                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+            if self.config.actor_rollout_ref.actor.get('use_invalid_action_penalty', True):
+                batch, _ = apply_invalid_action_penalty(
+                    batch, invalid_action_penalty_coef=self.config.actor_rollout_ref.actor.invalid_action_penalty_coef,
+                )
+            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+            batch = compute_advantage(batch, **adv_kwargs)
+            relace_inputs = relace_advantage_inputs(batch, **{k: v for k, v in adv_kwargs.items() if k != "adv_estimator"})
+
+            extras = dict(
+                original_prompts=original_prompts,
+                hindsight_prompts=hindsight_prompts,
+                actions=[str(a) for a in batch.non_tensor_batch["text_actions"]],
+                final_obs=[str(o) for o in batch.non_tensor_batch.get("final_obs", [""] * len(batch))],
+                training_advantages=batch.batch["advantages"],
+                meta=dict(
+                    checkpoint=checkpoint or self.config.actor_rollout_ref.model.path,
+                    environment=self.config.env.env_name,
+                    group_size=group_size,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    rollout_temperature=self.config.actor_rollout_ref.rollout.temperature,
+                    hindsight_template=self._hindsight_config().get("hindsight_template", "webshop_result"),
+                    created=datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            report = trajectory_analysis.build_report(relace_inputs, step_group_uids, **extras)
+            report["attempts"] = attempts
+            trajectory_analysis.write_report(report, out_dir)
+            trajectory_analysis.save_inputs(os.path.join(out_dir, "relace_inputs.pt"), relace_inputs, step_group_uids, extras)
+            trajectory_analysis.print_summary(report, out_dir)
+            return out_dir
+
+        with open(os.path.join(out_dir, "attempts.json"), "w") as f:
+            json.dump(attempts, f, indent=2)
+        raise RuntimeError(
+            f"[trajectory_analysis] no qualifying group in {max_attempts} attempts (see {out_dir}/attempts.json); "
+            "raise trajectory_analysis.max_attempts or the group size."
         )
 
     def fit(self):
@@ -1518,31 +1698,7 @@ class RayPPOTrainer:
 
                         # compute advantages, executed on the driver process
 
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
-                            use_pf_ppo=self.config.algorithm.use_pf_ppo,
-                            pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
-                            pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
-                            step_advantage_w=self.config.algorithm.get("gigpo", {}).get("step_advantage_w", 1.0),
-                            gigpo_mode=self.config.algorithm.get("gigpo", {}).get("mode", "mean_std_norm"),
-                            gigpo_enable_similarity=self.config.algorithm.get("gigpo", {}).get("enable_similarity", False),
-                            gigpo_similarity_thresh=self.config.algorithm.get("gigpo", {}).get("similarity_thresh", 0.95),
-                            **{
-                                f"relace_{key}": value
-                                for key, value in self.config.algorithm.get("relace", {}).items()
-                                if key != "hindsight_template"
-                            },
-                            history_length=getattr(self.config.env, "history_length", 2),
-                            epsilon=1e-6,
-                        )
+                        batch = compute_advantage(batch, **self._compute_advantage_kwargs())
                         if "relace_metrics" in batch.meta_info:
                             metrics.update(batch.meta_info.pop("relace_metrics"))
 

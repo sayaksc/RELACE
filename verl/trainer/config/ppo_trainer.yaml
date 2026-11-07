@@ -324,3 +324,15 @@ env:
     observation_mode: text_rich
     use_small: True
     human_goals: False
+
+# Optional RELACE trajectory-analysis diagnostic (no training). When enabled, main_ppo
+# samples rollout groups from a fixed checkpoint until one contains a success, a failure,
+# and a state shared across trajectories, then writes per-action RELACE intermediates.
+# Launch with examples/relace_trainer/analyze_trajectories.sh.
+trajectory_analysis:
+  enable: False
+  checkpoint: null # FSDP `global_step_<N>` dir (same GPU count as training); null = actor_rollout_ref.model.path weights
+  group_size: null # trajectories per group; null = env.rollout.n
+  max_attempts: 20 # rollout groups to sample before giving up
+  min_shared_trajectories: 2 # a matched state must be visited by at least this many trajectories
+  output_dir: null # null = ${trainer.default_local_dir}/trajectory_analysis

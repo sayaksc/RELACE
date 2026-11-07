@@ -85,4 +85,4 @@ fi
 mkdir -p "$OUTPUT_DIR"
 "$PYTHON_BIN" "${PROJECT_DIR}/examples/data_preprocess/prepare.py" --mode text \
   --local_dir "$DATA_DIR" --train_data_size "$TRAIN_BATCH_SIZE" --val_data_size "$VAL_BATCH_SIZE"
-"${cmd[@]}" 2>&1 | tee "${OUTPUT_DIR}/train.log"
+"${cmd[@]}" 2>&1 | tee "${OUTPUT_DIR}/${LOG_FILE:-train.log}"

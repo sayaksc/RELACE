@@ -268,6 +268,190 @@ def _metrics(
         }
 
 
+def compute_relace_components(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    hindsight_log_probs: torch.Tensor,
+    action_log_probs: torch.Tensor,
+    anchor_obs: np.array,
+    index: np.ndarray,
+    traj_index: np.ndarray,
+    timestep: np.ndarray | None = None,
+    episode_lengths: np.ndarray | None = None,
+    episode_returns: np.ndarray | torch.Tensor | None = None,
+    success_mask: np.ndarray | torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+    temp: float = 1.0,
+    clip_min: float = 0.1,
+    clip_max: float = 10.0,
+    omega: float = 1.0,
+    gamma: float = 0.95,
+    smooth: bool = False,
+    alpha: float = 1.0,
+    mode: str = "mean_std_norm",
+    enable_similarity: bool = True,
+    similarity_thresh: float = 0.95,
+    no_harm: bool = True,
+    step_group_uids: np.ndarray | None = None,
+    unit_rho: bool = False,
+) -> dict[str, Any]:
+    """
+    Run the RELACE advantage computation and return every intermediate quantity.
+
+    `compute_relace_advantage` is a thin wrapper around this function, so training
+    and diagnostics share one code path. Two keyword-only diagnostics hooks exist;
+    their defaults reproduce training exactly:
+
+    * `step_group_uids`: reuse a precomputed state grouping instead of calling
+      `build_step_group` (whose cluster labels are random UUIDs).
+    * `unit_rho`: replace the retrospective weight rho with 1 for every row while
+      keeping every other input and setting fixed (ablation of the hindsight term).
+
+    All per-row tensors have shape (bs,); token-level tensors have shape (bs, L).
+    """
+    if mode == "mean_std_norm":
+        remove_std = False
+    elif mode == "mean_norm":
+        remove_std = True
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    if clip_min > clip_max:
+        raise ValueError(f"relace.clip_min ({clip_min}) must be <= relace.clip_max ({clip_max})")
+
+    index = _as_numpy(index, object).reshape(-1)
+    traj_index = _as_numpy(traj_index, object).reshape(-1)
+    timesteps = _build_timesteps(traj_index, timestep)
+    lengths_np = _build_episode_lengths(traj_index, timesteps, episode_lengths)
+
+    bsz = token_level_rewards.shape[0]
+    if not (len(index) == len(traj_index) == len(timesteps) == len(lengths_np) == bsz):
+        raise ValueError("RELACE row metadata must have one value per batch row")
+
+    if np.any(lengths_np - timesteps < 0):
+        bad = np.where(lengths_np - timesteps < 0)[0][:5]
+        raise ValueError(f"RELACE found timestep greater than episode length at rows {bad.tolist()}")
+
+    # pH: length-normalized likelihood score of the executed action under the
+    # outcome-augmented (hindsight) prompt.
+    pi_hind = _compute_hindsight_probability(hindsight_log_probs, response_mask, temp=temp)
+
+    if action_log_probs is None:
+        raise ValueError("RELACE requires action_log_probs (log pi(a | X_t)) to form rho.")
+    # p: the same score under the original prompt X_t.
+    pi_orig = _compute_hindsight_probability(action_log_probs, response_mask, temp=temp)
+
+    # u = pH / p, self-normalized by its trajectory mean, then clipped -> rho.
+    raw_ratio = (pi_hind) / (pi_orig + epsilon)
+    ratio_traj_mean = torch.empty_like(raw_ratio)
+    for traj_uid in np.unique(traj_index):
+        locs = np.where(traj_index == traj_uid)[0]
+        locs_t = torch.as_tensor(locs, device=pi_hind.device, dtype=torch.long)
+        ratio_traj_mean[locs_t] = raw_ratio[locs_t].mean()
+
+    rho = torch.clamp(raw_ratio / (ratio_traj_mean + epsilon), min=clip_min, max=clip_max)
+    if unit_rho:
+        rho = torch.ones_like(rho)
+
+    if episode_returns is None:
+        returns = token_level_rewards.sum(dim=-1).clone()
+    else:
+        returns = _as_row_tensor(episode_returns, token_level_rewards)
+    if returns.shape[0] != bsz:
+        raise ValueError(f"episode_returns must have one value per row, got {returns.shape[0]} for batch size {bsz}")
+
+    macro_advantages, macro_rows = grpo_macro_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        traj_index=traj_index,
+        row_scores=returns,
+        epsilon=epsilon,
+        norm_adv_by_std=True,
+        compute_mean_std_cross_steps=(not remove_std),
+    )
+
+    exponents = torch.as_tensor(lengths_np - timesteps, device=returns.device, dtype=returns.dtype)
+    discounts = torch.pow(returns.new_tensor(gamma), exponents)
+    discounted_returns = discounts * returns  # reported only
+    # Keep the original evaluation order, (rho * discounts) * returns, so results are bit-identical.
+    weighted_returns = rho * discounts * returns
+    q_values = weighted_returns
+
+    if smooth:
+        q_values = _smooth_q_values(q_values, traj_index=traj_index, timesteps=timesteps, alpha=alpha)
+
+    # Anchor state grouping (Eq. 6 in the paper).
+    if step_group_uids is None:
+        step_group_uids = build_step_group(anchor_obs, index, enable_similarity, similarity_thresh)
+    else:
+        step_group_uids = _as_numpy(step_group_uids, object).reshape(-1)
+        if len(step_group_uids) != bsz:
+            raise ValueError(f"step_group_uids must have one value per row, got {len(step_group_uids)} for batch size {bsz}")
+
+    micro_rows_unmasked, micro_group_mean_abs_max = _normalize_by_group(
+        qvalues=q_values,
+        values=q_values,
+        index=step_group_uids,
+        epsilon=epsilon,
+        remove_std=remove_std
+    )
+    if no_harm:
+        micro_rows, do_no_harm_success_frac, do_no_harm_suppressed_frac = _apply_do_no_harm_mask(
+            micro_rows=micro_rows_unmasked,
+            success_mask=success_mask,
+        )
+    else:
+        micro_rows = micro_rows_unmasked
+        do_no_harm_success_frac = 0.0
+        do_no_harm_suppressed_frac = 0.0
+
+    micro_advantages = micro_rows.unsqueeze(-1).tile([1, response_mask.shape[-1]]) * response_mask
+    advantages = macro_advantages + omega * micro_advantages
+
+    metrics = _metrics(
+        rho=rho,
+        pi_hind=pi_hind,
+        q_values=q_values,
+        micro_rows=micro_rows,
+        clip_min=clip_min,
+        clip_max=clip_max,
+        micro_group_mean_abs_max=micro_group_mean_abs_max,
+        do_no_harm_success_frac=do_no_harm_success_frac,
+        do_no_harm_suppressed_frac=do_no_harm_suppressed_frac,
+    )
+    return {
+        "advantages": advantages,
+        "metrics": metrics,
+        # row metadata
+        "index": index,
+        "traj_index": traj_index,
+        "timesteps": timesteps,
+        "episode_lengths": lengths_np,
+        "step_group_uids": step_group_uids,
+        # retrospective weight
+        "p": pi_orig,
+        "p_hindsight": pi_hind,
+        "raw_ratio": raw_ratio,
+        "raw_ratio_traj_mean": ratio_traj_mean,
+        "rho": rho,
+        # returns
+        "terminal_returns": returns,
+        "discounts": discounts,
+        "discounted_returns": discounted_returns,
+        "weighted_returns": weighted_returns,
+        "smoothed_returns": q_values,
+        # advantages (row scalars; token-level = row * response_mask)
+        "macro_rows": macro_rows,
+        "local_rows_unmasked": micro_rows_unmasked,
+        "local_rows": micro_rows,
+        "final_rows": macro_rows + omega * micro_rows,
+        "macro_advantages": macro_advantages,
+        "local_advantages": micro_advantages,
+        "omega": omega,
+    }
+
+
 def compute_relace_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -299,136 +483,33 @@ def compute_relace_advantage(
     Args follow the GiGPO row protocol. `timestep` is one-based (`t=1..T`).
     `hindsight_log_probs` must be aligned to `response_mask` and contains the
     actor log-probabilities of the original action tokens under the
-    final-state-augmented prompt.
+    final-state-augmented prompt. See `compute_relace_components` for the
+    intermediate quantities.
     """
-    if mode == "mean_std_norm":
-        remove_std = False
-    elif mode == "mean_norm":
-        remove_std = True
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-
-
-    if clip_min > clip_max:
-        raise ValueError(f"relace.clip_min ({clip_min}) must be <= relace.clip_max ({clip_max})")
-
-    index = _as_numpy(index, object).reshape(-1)
-    traj_index = _as_numpy(traj_index, object).reshape(-1)
-    timesteps = _build_timesteps(traj_index, timestep)
-    lengths_np = _build_episode_lengths(traj_index, timesteps, episode_lengths)
-
-    bsz = token_level_rewards.shape[0]
-    if not (len(index) == len(traj_index) == len(timesteps) == len(lengths_np) == bsz):
-        raise ValueError("RELACE row metadata must have one value per batch row")
-
-    if np.any(lengths_np - timesteps < 0):
-        bad = np.where(lengths_np - timesteps < 0)[0][:5]
-        raise ValueError(f"RELACE found timestep greater than episode length at rows {bad.tolist()}")
-
-    pi_hind = _compute_hindsight_probability(hindsight_log_probs, response_mask, temp=temp)
-
-
-    ############
-
-    # pi_bar = torch.empty_like(pi_hind)
-    # for traj_uid in np.unique(traj_index):
-    #     locs = np.where(traj_index == traj_uid)[0]
-    #     locs_t = torch.as_tensor(locs, device=pi_hind.device, dtype=torch.long)
-    #     pi_bar[locs_t] = pi_hind[locs_t].mean()
-
-
-
-    # # Old pi_bar approach (commented out - using pi_act instead)
-    # rho = torch.clamp(pi_hind / (pi_bar + epsilon), min=clip_min, max=clip_max)
-
-
-
-    #######################
-    if action_log_probs is None:
-        raise ValueError("RELACE requires action_log_probs (log pi(a | X_t)) to form rho.")
-    pi_act = _compute_hindsight_probability(action_log_probs, response_mask, temp=temp)
-
-    # rho = torch.clamp(pi_hind / (pi_act + epsilon), min=clip_min, max=clip_max)
-    # Averaged rho over trajectory
-
-    pi_act = (pi_hind) / (pi_act+epsilon)
-    # pi_act = torch.clamp(pi_act, min=clip_min, max=clip_max)
-    pi_hca = torch.empty_like(pi_act)
-
-    for traj_uid in np.unique(traj_index):
-        locs = np.where(traj_index == traj_uid)[0]
-        locs_t = torch.as_tensor(locs, device=pi_hind.device, dtype=torch.long)
-        pi_hca[locs_t] = pi_act[locs_t].mean()
-
-
-    rho = torch.clamp(pi_act/(pi_hca+epsilon), min=clip_min, max=clip_max)
-
-
-
-
-    #####################
-
-    if episode_returns is None:
-        returns = token_level_rewards.sum(dim=-1).clone()
-    else:
-        returns = _as_row_tensor(episode_returns, token_level_rewards)
-    if returns.shape[0] != bsz:
-        raise ValueError(f"episode_returns must have one value per row, got {returns.shape[0]} for batch size {bsz}")
-
-    macro_advantages, _ = grpo_macro_advantage(
+    components = compute_relace_components(
         token_level_rewards=token_level_rewards,
         response_mask=response_mask,
+        hindsight_log_probs=hindsight_log_probs,
+        action_log_probs=action_log_probs,
+        anchor_obs=anchor_obs,
         index=index,
         traj_index=traj_index,
-        row_scores=returns,
+        timestep=timestep,
+        episode_lengths=episode_lengths,
+        episode_returns=episode_returns,
+        success_mask=success_mask,
         epsilon=epsilon,
-        norm_adv_by_std=True,
-        compute_mean_std_cross_steps=(not remove_std),
-    )
-
-    exponents = torch.as_tensor(lengths_np - timesteps, device=returns.device, dtype=returns.dtype)
-    discounts = torch.pow(returns.new_tensor(gamma), exponents)
-    q_values = rho * discounts * returns
-
-    if smooth:
-        q_values = _smooth_q_values(q_values, traj_index=traj_index, timesteps=timesteps, alpha=alpha)
-
-
-
-    # Anchor state grouping (Eq. 6 in the paper).
-    step_group_uids = build_step_group(anchor_obs, index, enable_similarity, similarity_thresh)
-
-
-
-
-    micro_rows, micro_group_mean_abs_max = _normalize_by_group(
-        qvalues=q_values,
-        values=q_values,
-        index=step_group_uids,
-        epsilon=epsilon,
-        remove_std=remove_std
-    )
-    if no_harm:
-        micro_rows, do_no_harm_success_frac, do_no_harm_suppressed_frac = _apply_do_no_harm_mask(
-            micro_rows=micro_rows,
-            success_mask=success_mask,
-        )
-    else:
-        do_no_harm_success_frac = 0.0
-        do_no_harm_suppressed_frac = 0.0
-
-    micro_advantages = micro_rows.unsqueeze(-1).tile([1, response_mask.shape[-1]]) * response_mask
-    advantages = macro_advantages + omega * micro_advantages
-
-    metrics = _metrics(
-        rho=rho,
-        pi_hind=pi_hind,
-        q_values=q_values,
-        micro_rows=micro_rows,
+        temp=temp,
         clip_min=clip_min,
         clip_max=clip_max,
-        micro_group_mean_abs_max=micro_group_mean_abs_max,
-        do_no_harm_success_frac=do_no_harm_success_frac,
-        do_no_harm_suppressed_frac=do_no_harm_suppressed_frac,
+        omega=omega,
+        gamma=gamma,
+        smooth=smooth,
+        alpha=alpha,
+        mode=mode,
+        enable_similarity=enable_similarity,
+        similarity_thresh=similarity_thresh,
+        no_harm=no_harm,
     )
-    return advantages, advantages, metrics
+    advantages = components["advantages"]
+    return advantages, advantages, components["metrics"]

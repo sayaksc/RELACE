@@ -158,11 +158,35 @@ bash examples/relace_trainer/run_webshop.sh \
 
 Use an existing `global_step_<step>` directory from your run. Omit `trainer.val_only=True` to resume training. The inherited [model merger](scripts/model_merger.py) is available for exporting distributed checkpoints; run it with `--help` to see its supported options.
 
+## Trajectory analysis (diagnostic)
+
+To inspect how RELACE assigns credit inside one rollout group without training:
+
+```bash
+CHECKPOINT="$PWD/outputs/relace_alfworld_seed0/global_step_150" \
+GROUP_SIZE=8 MAX_ATTEMPTS=20 \
+bash examples/relace_trainer/analyze_trajectories.sh alfworld
+```
+
+From the fixed checkpoint, the script samples one task group per attempt until a group has at least one successful trajectory, one failed trajectory, and a matched state visited by two or more trajectories. It then scores that group with the training code path: reward, `log pi(a|X_t)`, hindsight teacher forcing, and `compute_advantage`. No parameters are updated. `CHECKPOINT` is an FSDP `global_step_<N>` directory and must be loaded with the `NUM_GPUS` and `MODEL_PATH` used in training. Leave it unset to analyse the `MODEL_PATH` weights, or point `MODEL_PATH` to a merged Hugging Face export. Other `run.sh` variables and Hydra overrides apply. The settings live under `trajectory_analysis` in [ppo_trainer.yaml](verl/trainer/config/ppo_trainer.yaml).
+
+Results are written to `outputs/relace_trajectory_analysis_<env>/trajectory_analysis/<timestamp>/`:
+
+| File | Contents |
+|---|---|
+| `group.json` | The whole group: every action with observation, action, matched-state group, terminal reward, success flag, `p`, `pH`, `u`, `rho`, discounted/weighted/smoothed returns, macro advantage, local advantage before/after the success mask, final advantage, the `rho=1` recomputation, and both prompts |
+| `summary.md` | Trajectories, shared states, settings, metrics, and an all-actions RELACE vs `rho=1` table |
+| `trajectories/T<k>.md`, `.csv` | Per-trajectory tables, including the side-by-side `rho=1` comparison |
+| `prompts/T<k>.md` | Original and hindsight prompts for each action |
+| `relace_inputs.pt` | Saved inputs for CPU replay: `python -m relace.trajectory_analysis replay <file> --out <dir>` |
+
+The `rho=1` variant reuses the identical batch and state grouping and changes only the retrospective weight. `group.json` also records a cross-check against the advantages produced by `compute_advantage`, whose difference should be 0.
+
 ## Repository layout
 
 ```text
-relace/                         RELACE advantage estimation
-examples/relace_trainer/         ALFWorld and WebShop launchers
+relace/                         RELACE advantage estimation and trajectory analysis
+examples/relace_trainer/         ALFWorld and WebShop launchers, trajectory-analysis launcher
 examples/data_preprocess/        Local placeholder-data preparation
 agent_system/                   Environment adapters, memory, and rollouts
 verl/                           Training framework and workers
