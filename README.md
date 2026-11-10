@@ -144,6 +144,23 @@ The launcher chooses the `alfworld` or `webshop` hindsight template automaticall
 
 Metrics use the `relace/` prefix, including retrospective-ratio statistics, local-advantage magnitude, success-mask statistics, and hindsight scoring time.
 
+### GiGPO with RELACE-style smoothing and success protection
+
+The GiGPO baseline (`algorithm.adv_estimator=gigpo`) can use the same two refinements RELACE applies to its local advantage. Both are off by default, which is the original GiGPO, and act only on the step-level term:
+
+| Setting | Effect |
+|---|---|
+| `algorithm.gigpo.smooth`, `algorithm.gigpo.alpha` | Before the anchor-state-group normalization, smooth each step's discounted return along its trajectory: `q'_t = alpha * q_t + (1 - alpha) * q_{t+1}` (the last step keeps its own value). `alpha=1.0` is a no-op. |
+| `algorithm.gigpo.no_harm` | After the anchor-state-group normalization, zero the *negative* step advantages of rows whose episode succeeded (`episode_success > 0`). The episode-level term is unchanged. |
+
+```bash
+bash examples/relace_trainer/run_webshop.sh \
+  algorithm.adv_estimator=gigpo \
+  algorithm.gigpo.smooth=True algorithm.gigpo.alpha=0.5 algorithm.gigpo.no_harm=True
+```
+
+With these enabled, `gigpo/do_no_harm_success_frac` and `gigpo/do_no_harm_suppressed_frac` are logged. The implementation is in [core_gigpo.py](gigpo/core_gigpo.py); `tests/test_gigpo.py` checks it against hand-computed values and against RELACE's own helpers.
+
 ## Evaluate or resume
 
 To evaluate a saved training checkpoint, use the same initial model architecture and launch settings:

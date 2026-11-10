@@ -405,7 +405,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.GiGPO:
-        advantages, returns = core_gigpo.compute_gigpo_outcome_advantage(
+        advantages, returns, gigpo_metrics = core_gigpo.compute_gigpo_outcome_advantage(
             token_level_rewards=data.batch['token_level_rewards'], # for episode group reward computing
             step_rewards=data.batch['step_rewards'], # for step group reward computing
             response_mask=data.batch['response_mask'],
@@ -416,9 +416,17 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             mode=gigpo_mode,
             enable_similarity=kwargs.get('gigpo_enable_similarity', False),
             similarity_thresh=kwargs.get('gigpo_similarity_thresh', 0.95),
+            # RELACE-style step-value smoothing and do-no-harm mask (both off unless enabled in the config)
+            timestep=data.non_tensor_batch.get('t', None),
+            success_mask=data.non_tensor_batch.get('episode_success', None),
+            smooth=kwargs.get('gigpo_smooth', False),
+            alpha=kwargs.get('gigpo_alpha', 1.0),
+            no_harm=kwargs.get('gigpo_no_harm', False),
+            return_metrics=True,
             )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+        data.meta_info['gigpo_metrics'] = gigpo_metrics
     elif adv_estimator == AdvantageEstimator.RELACE:
         relace_inputs = relace_advantage_inputs(
             data, gamma=gamma, step_advantage_w=step_advantage_w, gigpo_mode=gigpo_mode, **kwargs
@@ -1199,6 +1207,9 @@ class RayPPOTrainer:
             gigpo_mode=self.config.algorithm.get("gigpo", {}).get("mode", "mean_std_norm"),
             gigpo_enable_similarity=self.config.algorithm.get("gigpo", {}).get("enable_similarity", False),
             gigpo_similarity_thresh=self.config.algorithm.get("gigpo", {}).get("similarity_thresh", 0.95),
+            gigpo_smooth=self.config.algorithm.get("gigpo", {}).get("smooth", False),
+            gigpo_alpha=self.config.algorithm.get("gigpo", {}).get("alpha", 1.0),
+            gigpo_no_harm=self.config.algorithm.get("gigpo", {}).get("no_harm", False),
             **{
                 f"relace_{key}": value
                 for key, value in self.config.algorithm.get("relace", {}).items()
@@ -1701,6 +1712,8 @@ class RayPPOTrainer:
                         batch = compute_advantage(batch, **self._compute_advantage_kwargs())
                         if "relace_metrics" in batch.meta_info:
                             metrics.update(batch.meta_info.pop("relace_metrics"))
+                        if "gigpo_metrics" in batch.meta_info:
+                            metrics.update(batch.meta_info.pop("gigpo_metrics"))
 
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:

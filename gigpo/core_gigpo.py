@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from verl import DataProto
 import uuid
+import warnings
 
 from difflib import SequenceMatcher
 from typing import Sequence, List, Dict, Any
@@ -136,6 +137,84 @@ def compute_step_discounted_returns(batch: DataProto, gamma: float):
     all_returns = torch.tensor(all_returns, dtype=torch.float32, device=batch.batch['input_ids'].device)
     return all_returns
 
+
+def _build_timesteps(traj_index: np.ndarray, timestep: np.ndarray | None) -> np.ndarray:
+    """One-based step number per row; falls back to the row order within each trajectory."""
+    if timestep is not None:
+        return np.asarray(timestep).astype(np.int64).reshape(-1)
+
+    counters = defaultdict(int)
+    timesteps = np.zeros(len(traj_index), dtype=np.int64)
+    for row, traj_uid in enumerate(traj_index):
+        counters[traj_uid] += 1
+        timesteps[row] = counters[traj_uid]
+    return timesteps
+
+
+def smooth_step_values(values: torch.Tensor, traj_index: np.ndarray, timesteps: np.ndarray, alpha: float) -> torch.Tensor:
+    """
+    One-step temporal smoothing of per-step values along each trajectory:
+    `v'_t = alpha * v_t + (1 - alpha) * v_{t+1}`, with the last step of a trajectory
+    keeping its own value. `alpha=1.0` leaves `values` unchanged. This is the same
+    smoothing RELACE applies to its Q-values (`relace.core_relace._smooth_q_values`).
+
+    Args:
+        values: `(torch.Tensor)` shape: (bs,)
+        traj_index: `(np.array)` shape: (bs,)
+        timesteps: `(np.array)` shape: (bs,), the order of rows within a trajectory.
+        alpha: float in [0, 1].
+    """
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError(f"gigpo.alpha must be in [0, 1], got {alpha}")
+
+    smoothed = values.clone()
+    for traj_uid in np.unique(traj_index):
+        locs = np.where(traj_index == traj_uid)[0]
+        locs = locs[np.argsort(timesteps[locs], kind="stable")]
+        for pos, row in enumerate(locs):
+            next_row = locs[pos + 1] if pos + 1 < len(locs) else row
+            smoothed[row] = alpha * values[row] + (1.0 - alpha) * values[next_row]
+    return smoothed
+
+
+def apply_no_harm_mask(
+    step_rows: torch.Tensor,
+    success_mask: np.ndarray | torch.Tensor | None,
+) -> tuple[torch.Tensor, float, float]:
+    """
+    Do-no-harm mask for the step-level advantage: on rows that belong to a successful
+    episode, negative step advantages are zeroed so the step term can never push down
+    an action of a trajectory that reached the goal. Positive step advantages and all
+    rows of unsuccessful episodes are untouched. This is the same mask RELACE applies
+    to its local advantage (`relace.core_relace._apply_do_no_harm_mask`).
+
+    Args:
+        step_rows: `(torch.Tensor)` shape: (bs,), normalized step advantages (one scalar per row).
+        success_mask: `(np.array | torch.Tensor | None)` shape: (bs,), positive = successful
+            episode. `None` disables the mask.
+
+    Returns:
+        masked rows, fraction of rows in a successful episode, fraction of rows suppressed.
+    """
+    if success_mask is None:
+        return step_rows, 0.0, 0.0
+
+    if isinstance(success_mask, torch.Tensor):
+        success_values = success_mask.detach().to(device=step_rows.device, dtype=step_rows.dtype).reshape(-1)
+    else:
+        success_values = torch.as_tensor(
+            np.asarray(success_mask).astype(np.float32), device=step_rows.device, dtype=step_rows.dtype
+        ).reshape(-1)
+    success_rows = success_values > 0
+    if success_rows.shape[0] != step_rows.shape[0]:
+        raise ValueError(f"success_mask must have one value per row, got {success_rows.shape[0]} for batch size {step_rows.shape[0]}")
+
+    suppressed = success_rows & (step_rows < 0)
+    masked_rows = torch.where(suppressed, torch.zeros_like(step_rows), step_rows)
+    success_frac = success_rows.to(torch.float32).mean().detach().cpu().item()
+    suppressed_frac = suppressed.to(torch.float32).mean().detach().cpu().item()
+    return masked_rows, success_frac, suppressed_frac
+
 # ---------------------------------------------------------- #
 # ---------------- Core Functions of GiGPO ----------------- #
 # ---------------------------------------------------------- #
@@ -151,9 +230,27 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    mode: str = "mean_norm",
                                    enable_similarity: bool = False,
                                    similarity_thresh: float = 0.95,
+                                   timestep: np.ndarray | None = None,
+                                   success_mask: np.ndarray | torch.Tensor | None = None,
+                                   smooth: bool = False,
+                                   alpha: float = 1.0,
+                                   no_harm: bool = False,
+                                   return_metrics: bool = False,
                                    ):
     """
     Compute the advantages for GiGPO (https://arxiv.org/abs/2505.10978).
+
+    Two optional RELACE-style refinements of the step-level term (both off by default,
+    which reproduces the original GiGPO exactly):
+
+    * `smooth`: smooth the step values (the discounted returns in `step_rewards`) along each
+      trajectory, `q'_t = alpha * q_t + (1 - alpha) * q_{t+1}`, before the anchor-state-group
+      normalization. `timestep` (one-based) orders the rows of a trajectory; if omitted, row
+      order within each trajectory is used.
+    * `no_harm`: after the anchor-state-group normalization, zero the *negative* step advantages
+      of rows whose episode succeeded (`success_mask > 0`). The episode-level term is untouched.
+
+    With `return_metrics=True` a third value is returned: a dict of `gigpo/do_no_harm_*` statistics.
     """
     if mode == "mean_std_norm":
         remove_std = False
@@ -161,18 +258,40 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
         remove_std = True
     else:
         raise ValueError(f"Unknown mode: {mode}")
-    
+
+    if no_harm and success_mask is None:
+        warnings.warn("gigpo no_harm is enabled but no success_mask was given; the mask is a no-op.", stacklevel=2)
+
     # Compute episode relative advantages (Eq. 3 in the paper).
     episode_advantages = episode_norm_reward(token_level_rewards, response_mask, index, traj_index, epsilon, remove_std)
-    
+
     # Anchor state grouping (Eq. 6 in the paper).
     step_group_uids = build_step_group(anchor_obs, index, enable_similarity, similarity_thresh)
 
+    # Optional temporal smoothing of the step values (RELACE-style).
+    if smooth:
+        traj_index_np = np.asarray(traj_index, dtype=object).reshape(-1)
+        timesteps = _build_timesteps(traj_index_np, timestep)
+        step_rewards = smooth_step_values(step_rewards, traj_index_np, timesteps, alpha)
+
     # Compute step relative advantages (Eq. 7 in the paper).
-    step_advantages = step_norm_reward(step_rewards, response_mask, step_group_uids, epsilon, remove_std)
+    step_rows = step_norm_rows(step_rewards, step_group_uids, epsilon, remove_std)
+
+    # Optional do-no-harm mask on the step advantages (RELACE-style).
+    do_no_harm_success_frac = 0.0
+    do_no_harm_suppressed_frac = 0.0
+    if no_harm:
+        step_rows, do_no_harm_success_frac, do_no_harm_suppressed_frac = apply_no_harm_mask(step_rows, success_mask)
+    step_advantages = step_rows.unsqueeze(-1).tile([1, response_mask.shape[-1]]) * response_mask
 
     # Compute joint advantages (Eq. 8 in the paper).
     scores = episode_advantages + step_advantage_w * step_advantages
+    if return_metrics:
+        metrics = {
+            "gigpo/do_no_harm_success_frac": do_no_harm_success_frac,
+            "gigpo/do_no_harm_suppressed_frac": do_no_harm_suppressed_frac,
+        }
+        return scores, scores, metrics
     return scores, scores
 
 
@@ -349,7 +468,7 @@ def step_norm_reward(step_rewards: torch.Tensor,
             shape: (bs,)
         response_mask: `(torch.Tensor)`
             shape: (bs, response_length)
-    
+
     Returns:
         advantages: `(torch.Tensor)`
             shape: (bs, response_length)
@@ -357,6 +476,19 @@ def step_norm_reward(step_rewards: torch.Tensor,
             shape: (bs, response_length)
     """
     response_length = response_mask.shape[-1]
+    scores = step_norm_rows(step_rewards, index, epsilon, remove_std)
+    return scores.unsqueeze(-1).tile([1, response_length]) * response_mask
+
+
+def step_norm_rows(step_rewards: torch.Tensor,
+                   index: np.array,
+                   epsilon: float = 1e-6,
+                   remove_std: bool = True,
+                   ):
+    """
+    Row-level step advantages: normalize `step_rewards` within each step group (`index`).
+    Returns one scalar per row, shape: (bs,). `step_norm_reward` broadcasts these onto tokens.
+    """
     scores = step_rewards.clone()
 
     id2score = defaultdict(list)
@@ -384,7 +516,6 @@ def step_norm_reward(step_rewards: torch.Tensor,
                 scores[i] = scores[i] - id2mean[index[i]]
             else:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
-        step_advantages = scores.unsqueeze(-1).tile([1, response_length]) * response_mask
-    
-    return step_advantages
+
+    return scores
 
