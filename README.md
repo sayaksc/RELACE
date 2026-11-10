@@ -153,11 +153,24 @@ The GiGPO baseline (`algorithm.adv_estimator=gigpo`) can use the same two refine
 | `algorithm.gigpo.smooth`, `algorithm.gigpo.alpha` | Before the anchor-state-group normalization, smooth each step's discounted return along its trajectory: `q'_t = alpha * q_t + (1 - alpha) * q_{t+1}` (the last step keeps its own value). `alpha=1.0` is a no-op. |
 | `algorithm.gigpo.no_harm` | After the anchor-state-group normalization, zero the *negative* step advantages of rows whose episode succeeded (`episode_success > 0`). The episode-level term is unchanged. |
 
+The settings live under `algorithm.gigpo` in [ppo_trainer.yaml](verl/trainer/config/ppo_trainer.yaml). The GiGPO launchers use the same training profile as the RELACE ones, so the two are directly comparable, and expose the options as environment variables:
+
 ```bash
-bash examples/relace_trainer/run_webshop.sh \
-  algorithm.adv_estimator=gigpo \
-  algorithm.gigpo.smooth=True algorithm.gigpo.alpha=0.5 algorithm.gigpo.no_harm=True
+bash examples/gigpo_trainer/run_webshop.sh                  # smoothing (alpha 0.5) + no-harm on
+GIGPO_ALPHA=0.7 bash examples/gigpo_trainer/run_alfworld.sh # change the smoothing coefficient
+GIGPO_SMOOTH=False GIGPO_NO_HARM=False \
+  bash examples/gigpo_trainer/run_webshop.sh                # original GiGPO
 ```
+
+| Variable | Setting | Launcher default |
+|---|---|---|
+| `GIGPO_SMOOTH` | `algorithm.gigpo.smooth` | `True` |
+| `GIGPO_ALPHA` | `algorithm.gigpo.alpha` | `0.5` |
+| `GIGPO_NO_HARM` | `algorithm.gigpo.no_harm` | `True` |
+| `GIGPO_OMEGA` | `algorithm.gigpo.step_advantage_w` | `1.0` |
+| `GIGPO_GAMMA` | `algorithm.gamma` | `0.6` (as RELACE) |
+
+The launcher defaults enable both refinements, while the YAML defaults keep them off so `adv_estimator=gigpo` stays the original GiGPO when launched any other way. Resource and data variables (`MODEL_PATH`, `SEED`, `NUM_GPUS`, `GROUP_SIZE`, ...) and trailing Hydra overrides work as in `run.sh`; `DRY_RUN=1` prints the command.
 
 With these enabled, `gigpo/do_no_harm_success_frac` and `gigpo/do_no_harm_suppressed_frac` are logged. The implementation is in [core_gigpo.py](gigpo/core_gigpo.py); `tests/test_gigpo.py` checks it against hand-computed values and against RELACE's own helpers.
 
@@ -204,6 +217,7 @@ The `rho=1` variant reuses the identical batch and state grouping and changes on
 ```text
 relace/                         RELACE advantage estimation and trajectory analysis
 examples/relace_trainer/         ALFWorld and WebShop launchers, trajectory-analysis launcher
+examples/gigpo_trainer/          GiGPO launchers (optional RELACE-style smoothing / no-harm)
 examples/data_preprocess/        Local placeholder-data preparation
 agent_system/                   Environment adapters, memory, and rollouts
 verl/                           Training framework and workers

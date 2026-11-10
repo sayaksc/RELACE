@@ -33,6 +33,30 @@ def test_launch_profile(environment, model, mini_batch, max_steps):
     assert Path(args[1]).is_file()
 
 
+@pytest.mark.parametrize('environment,max_steps', [('alfworld', '50'), ('webshop', '15')])
+def test_gigpo_launch_profile(environment, max_steps):
+    base = dict(os.environ, DRY_RUN='1', LOGGER='console')
+    for name in ['PROJECT_DIR', 'GIGPO_SMOOTH', 'GIGPO_ALPHA', 'GIGPO_NO_HARM', 'GIGPO_GAMMA', 'GIGPO_OMEGA']:
+        base.pop(name, None)
+    script = str(ROOT / f'examples/gigpo_trainer/run_{environment}.sh')
+
+    args = shlex.split(subprocess.check_output(['bash', script, 'vllm', 'trainer.total_training_steps=7'], env=base, text=True))
+    assert 'algorithm.adv_estimator=gigpo' in args
+    assert not any(arg.startswith('algorithm.relace.') for arg in args)
+    assert f'env.max_steps={max_steps}' in args
+    for default in ['algorithm.gamma=0.6', 'algorithm.gigpo.smooth=True', 'algorithm.gigpo.alpha=0.5',
+                    'algorithm.gigpo.no_harm=True', 'algorithm.gigpo.step_advantage_w=1.0']:
+        assert default in args
+    assert args[-1] == 'trainer.total_training_steps=7'
+    assert Path(args[1]).is_file()
+
+    custom = dict(base, GIGPO_SMOOTH='False', GIGPO_ALPHA='0.7', GIGPO_NO_HARM='False', GIGPO_GAMMA='0.95', GIGPO_OMEGA='0.5')
+    args = shlex.split(subprocess.check_output(['bash', script], env=custom, text=True))
+    for setting in ['algorithm.gamma=0.95', 'algorithm.gigpo.smooth=False', 'algorithm.gigpo.alpha=0.7',
+                    'algorithm.gigpo.no_harm=False', 'algorithm.gigpo.step_advantage_w=0.5']:
+        assert setting in args
+
+
 def test_data_preparation_is_local_and_has_expected_schema():
     path = ROOT / 'examples/data_preprocess/prepare.py'
     spec = importlib.util.spec_from_file_location('prepare', path)

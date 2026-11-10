@@ -260,6 +260,8 @@ algorithm:
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
     # Optional RELACE-style refinements of the GiGPO step-level term (used when adv_estimator=gigpo; both off by
     # default, which is the original GiGPO). RELACE's own settings live under algorithm.relace.
+    # Change them here, with Hydra overrides (algorithm.gigpo.smooth=True), or via the GIGPO_* environment
+    # variables of examples/gigpo_trainer/run.sh (whose defaults turn both on).
     smooth: False # smooth step values along each trajectory, q'_t = alpha * q_t + (1 - alpha) * q_{t+1}
     alpha: 0.5 # smoothing coefficient; 1.0 leaves the step values unchanged
     no_harm: False # zero negative step advantages on rows of successful episodes
