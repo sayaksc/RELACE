@@ -343,3 +343,15 @@ trajectory_analysis:
   max_attempts: 20 # rollout groups to sample before giving up
   min_shared_trajectories: 2 # a matched state must be visited by at least this many trajectories
   output_dir: null # null = ${trainer.default_local_dir}/trajectory_analysis
+
+# Optional online credit-estimation diagnostics for RELACE (adv_estimator=relace). During training, every
+# `log_interval` updates, compares GiGPO-style (G) and RELACE-style (rho*G) unnormalized local credit against a
+# cross-fitted action-value proxy on the SAME rollout batch, and logs `credit_diag/...` through the normal training
+# logger (console / W&B). Read-only: it changes no reward, advantage, gradient, sampling or update, and adds no
+# rollouts or forward passes. See README.md ("Credit-estimation diagnostics") for definitions and limitations.
+credit_diagnostics:
+  enable: False
+  log_interval: 5 # run on training updates that are multiples of this
+  min_reference_trajectories: 2 # distinct other-fold trajectories required per (observation, action) reference
+  extra_gammas: [] # extra discount factors to report on the same trajectories/rho, e.g. [0.6, 0.95]
+  fold_seed: 0 # salt of the reproducible trajectory-to-fold rule (ids only; independent of rewards)

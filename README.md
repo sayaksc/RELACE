@@ -212,10 +212,80 @@ Results are written to `outputs/relace_trajectory_analysis_<env>/trajectory_anal
 
 The `rho=1` variant reuses the identical batch and state grouping and changes only the retrospective weight. `group.json` also records a cross-check against the advantages produced by `compute_advantage`, whose difference should be 0.
 
+## Credit-estimation diagnostics (online, optional)
+
+During RELACE training, `credit_diagnostics` compares GiGPO-style and RELACE-style **unnormalized local credit** against an independent action-value proxy on the *same rollout batch and frozen behavior policy*. It is a proxy for the variance-reduction condition, not a measurement from two separately trained runs. It is read-only: it changes no reward, advantage, gradient, sampling, or update, and adds no rollouts, scoring passes, simulator snapshots, or critic. Metrics go through the existing training logger (W&B when `LOGGER=wandb`), keyed by the global training step.
+
+**Enable it** (off by default). It is read once at start-up, so it takes effect on your next launch or checkpoint resume. `trainer.resume_mode` defaults to `auto`, so relaunching with the same `EXPERIMENT_NAME` and `OUTPUT_DIR` resumes from the latest `global_step_<N>`:
+
+```bash
+LOGGER=wandb WANDB_API_KEY=... \
+bash examples/relace_trainer/run_webshop.sh \
+  credit_diagnostics.enable=True \
+  'credit_diagnostics.extra_gammas=[0.6,0.95]'
+```
+
+To resume from a specific checkpoint instead, add `trainer.resume_mode=resume_path trainer.resume_from_path="$PWD/outputs/<experiment>/global_step_<N>"`. A relaunch starts a new process, so `Tracking` opens a W&B run as usual; to continue the old run, export W&B's standard `WANDB_RUN_ID=<id>` and `WANDB_RESUME=allow` first (the id is printed as `wandb run id:` at start-up; this is W&B behavior, not exercised here). The diagnostics add no state to checkpoints.
+
+| `credit_diagnostics.` | Default | Meaning |
+|---|---|---|
+| `enable` | `False` | Turn the diagnostics on (only with `algorithm.adv_estimator=relace`). |
+| `log_interval` | `5` | Run on updates that are multiples of this (so a resumed run keeps its cadence). |
+| `min_reference_trajectories` | `2` | Distinct other-fold trajectories required to form `Q_hat(o, a)`. |
+| `extra_gammas` | `[]` | Extra discounts, evaluated on the same trajectories and `rho`. The training `algorithm.gamma` is always evaluated. |
+| `fold_seed` | `0` | Salt of the trajectory-to-fold rule. |
+
+### What is computed
+
+For each valid rollout step `i`, with the implementation's indexing `G_i = gamma^(T_i - t_i) * R_i` (one-based `t`, episode length `T`, episode return `R`), `rho_i` the trajectory-normalized, clipped RELACE weight, and `D_i = (rho_i - 1) * G_i`. These are taken *before* smoothing, local standardization, the success mask, and the episode-level term, with the same `gamma` for both estimators.
+
+* **Cross-fitting.** Within each task (`uid`), whole trajectories are split into two folds by a hash of `(fold_seed, task id, trajectory id)`, alternating by rank. No reward, outcome, or weight is consulted. `Q_hat(o_i, a_i)` for a row is built only from the **other** fold: rows with the same task, the existing RELACE anchor group (its similarity matching is reused), and the **exact executed response token sequence** (padding excluded; different reasoning is never collapsed onto the same parsed command). It is the *trajectory-balanced* mean of `G`: average within each reference trajectory, then across reference trajectories, so a looping trajectory cannot dominate. Rows with fewer than `min_reference_trajectories` reference trajectories get no `Q_hat` and are dropped, never replaced by an observation mean or a stale estimate.
+* **Diagnostic groups.** One per `(task, anchor group, evaluation fold)`, restricted to rows with a valid `Q_hat`, kept if it has at least two such rows from at least two distinct evaluation trajectories. Folds are never recombined before group moments. Inside a group, with every mean over exactly the same rows and denominator `n_g`:
+
+```
+A_G = G - mean(G)      A_H = rho*G - mean(rho*G)      A_ref = Q_hat - mean(Q_hat)
+mse_gigpo  = mean((A_G - A_ref)^2)       mse_relace = mean((A_H - A_ref)^2)       gap = mse_relace - mse_gigpo
+N_hat = G - Q_hat      var_D = mean((D - mean D)^2)      cov_ND = mean((N_hat - mean N_hat)(D - mean D))
+gap  ==  var_D + 2 * cov_ND
+```
+
+* **Aggregation.** Occurrence-weighted, `sum_g(n_g * m_g) / sum_g(n_g)`, in float64. All-zero-return groups stay in (they are legitimate zeros); singleton and unsupported groups are excluded and counted. The relative reduction is `100 * (mse_gigpo - mse_relace) / mse_gigpo` from the aggregate MSEs, and is omitted when `mse_gigpo < 1e-8` (`RELATIVE_DENOMINATOR_FLOOR`). Nothing is carried across updates.
+* **Where it runs.** `compute_advantage` runs on the Ray driver over the fully gathered batch, before `balance_batch`, so every task group is complete; there are no rank-local fragments to merge. Cost is a few Python passes over the batch rows, every `log_interval` updates (`credit_diag/compute_seconds`). If it ever raises, the error is printed, `credit_diag/failed=1` is logged, and training continues unchanged.
+
+### W&B keys
+
+Error metrics are logged per discount under `credit_diag/gamma_<g>/` (for example `gamma_0.6`, `gamma_0.95`), only when at least one diagnostic group exists. A missing key means "not computable", never zero.
+
+| Key (under `credit_diag/gamma_<g>/`) | Meaning |
+|---|---|
+| `proxy_mse_gigpo`, `proxy_mse_relace` | Occurrence-weighted proxy credit-estimation MSE |
+| `proxy_mse_gap` | `proxy_mse_relace - proxy_mse_gigpo`; **negative means RELACE is closer to the proxy** |
+| `correction_variance` | `var(D)`: the variance RELACE's correction adds |
+| `noise_correction_covariance` | `cov(N_hat, D)` |
+| `proxy_gap_from_covariance` | `var(D) + 2 cov(N_hat, D)`, the same gap computed the other way |
+| `relative_mse_reduction_pct` | Reduction of the aggregate MSE in percent (omitted below the floor) |
+| `group_mean_proxy_gap`, `fraction_groups_negative_gap` | Unweighted mean of `gap_g`; share of groups with `gap_g < 0` |
+| `identity_max_abs_error` | Largest `|gap_g - (var_D + 2 cov)|` over groups (floating-point check, around 1e-14) |
+
+Coverage, independent of the discount, under `credit_diag/coverage/`: `total_valid_steps`, `steps_with_valid_q_reference`, `steps_with_insufficient_reference`, `eligible_steps`, `eligible_step_fraction`, `eligible_groups`, `evaluated_group_folds`, `original_anchor_groups`, `singleton_groups` (fewer than two evaluation trajectories), `insufficient_reference_groups` (enough evaluation trajectories but missing references), `ref_trajectories_{mean,min,max}` (over rows with a valid reference), and `fraction_groups_fully_retained` (eligible groups that lost no evaluation row to missing references). Coverage is always logged, even when no error metric can be computed. `credit_diag/compute_seconds` is the overhead.
+
+### Charts to create
+
+1. `proxy_mse_gigpo` and `proxy_mse_relace` against training step.
+2. `proxy_mse_gap` with a horizontal reference line at 0 (below 0 = lower RELACE proxy MSE).
+3. `correction_variance` and `-2 * noise_correction_covariance` on one chart (a W&B expression, `-2 * noise_correction_covariance`). The condition holds when the second exceeds the first, which is the same statement as a negative gap.
+4. `coverage/eligible_step_fraction` next to these, since they only describe the supported subset.
+
+### How to read it
+
+These are finite-group, cross-fitted **proxy** advantage-error metrics. The covariance expression and the MSE difference are two calculations of one sample identity, not independent evidence. Limitations: `Q_hat` is imperfect and exists only where the policy repeated an exact response; observation matching is the approximate anchor grouping; the metrics describe the **supported evaluation subset**, not the full production group (filtering and cross-fitting shrink it, and `fraction_groups_fully_retained` says by how much); groups are finite and centered on their own sample mean; every evaluation row of a (state, action) shares one reference estimate; and the trajectory-balanced weighting is a choice. They support an analysis of the proposed mechanism; they do not establish the population statement or that RELACE improves policy performance.
+
+**Expect low coverage.** Responses are free-form `<think>...</think><action>...</action>` text sampled at temperature 1.0, and the action key is the exact token sequence, so two trajectories rarely repeat the same response at a matched state. With `GROUP_SIZE=8` each reference fold holds only about four trajectories per task, and `min_reference_trajectories=2` needs two of them to agree exactly. Watch `eligible_step_fraction` before trusting the error curves; `min_reference_trajectories=1` raises coverage at the cost of a noisier `Q_hat`.
+
 ## Repository layout
 
 ```text
-relace/                         RELACE advantage estimation and trajectory analysis
+relace/                         RELACE advantage estimation, trajectory analysis, online credit diagnostics
 examples/relace_trainer/         ALFWorld and WebShop launchers, trajectory-analysis launcher
 examples/gigpo_trainer/          GiGPO launchers (optional RELACE-style smoothing / no-harm)
 examples/data_preprocess/        Local placeholder-data preparation

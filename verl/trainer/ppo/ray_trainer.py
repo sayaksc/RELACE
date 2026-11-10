@@ -19,6 +19,7 @@ Self-contained for upstream verl-agent submission. Ensures adjust_batch() is cal
 *after* compute_advantage() so group-based adv (RELACE/GRPO/RLOO) runs on original batch order.
 """
 
+import dataclasses
 import json
 import os
 import uuid
@@ -67,6 +68,7 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 from gigpo import core_gigpo
 from relace import core_relace
+from relace import credit_diagnostics
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 
@@ -431,10 +433,24 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         relace_inputs = relace_advantage_inputs(
             data, gamma=gamma, step_advantage_w=step_advantage_w, gigpo_mode=gigpo_mode, **kwargs
         )
-        advantages, returns, relace_metrics = core_relace.compute_relace_advantage(**relace_inputs)
+        # `compute_relace_advantage` is a thin wrapper around `compute_relace_components` (advantages = components[
+        # "advantages"], returns = advantages), so the training result is identical. Taking the components lets the
+        # optional credit diagnostics reuse this batch's anchor groups and rho instead of recomputing them.
+        components = core_relace.compute_relace_components(**relace_inputs)
+        advantages = returns = components["advantages"]
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
-        data.meta_info['relace_metrics'] = relace_metrics
+        data.meta_info['relace_metrics'] = components["metrics"]
+        credit_diag = kwargs.get('credit_diag')
+        if credit_diagnostics.is_due(credit_diag, kwargs.get('global_step')):
+            # Read-only proxy diagnostics on the gathered driver-side batch; they never touch the advantages above.
+            data.meta_info['credit_diag_metrics'] = credit_diagnostics.compute_credit_diagnostics_safe(
+                components=components,
+                responses=data.batch['responses'],
+                response_mask=data.batch['response_mask'],
+                gamma=relace_inputs['gamma'],
+                cfg=credit_diag,
+            )
 
 
 
@@ -1538,6 +1554,14 @@ class RayPPOTrainer:
         if "wandb" in logger.logger:
             print(f"wandb run id: {logger.logger['wandb'].run.id}")
 
+        # Optional online credit-estimation diagnostics (RELACE only; logged through this same `logger`).
+        credit_diag_cfg = credit_diagnostics.CreditDiagConfig.from_config(self.config.get("credit_diagnostics", None))
+        if credit_diag_cfg.enable and self.config.algorithm.adv_estimator != AdvantageEstimator.RELACE:
+            print("[credit_diagnostics] enabled but algorithm.adv_estimator is not 'relace' (no rho to analyse): disabled.")
+            credit_diag_cfg = dataclasses.replace(credit_diag_cfg, enable=False)
+        if credit_diag_cfg.enable:
+            print(f"[credit_diagnostics] enabled: {credit_diag_cfg}")
+
         self.global_steps = 0
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -1709,11 +1733,18 @@ class RayPPOTrainer:
 
                         # compute advantages, executed on the driver process
 
-                        batch = compute_advantage(batch, **self._compute_advantage_kwargs())
+                        batch = compute_advantage(
+                            batch,
+                            **self._compute_advantage_kwargs(),
+                            credit_diag=credit_diag_cfg,
+                            global_step=self.global_steps,
+                        )
                         if "relace_metrics" in batch.meta_info:
                             metrics.update(batch.meta_info.pop("relace_metrics"))
                         if "gigpo_metrics" in batch.meta_info:
                             metrics.update(batch.meta_info.pop("gigpo_metrics"))
+                        if "credit_diag_metrics" in batch.meta_info:
+                            metrics.update(batch.meta_info.pop("credit_diag_metrics"))
 
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
